@@ -31,6 +31,10 @@ def load_config():
             'delete_older_than': '259200',
             'delete_originals': 'true'
         }
+        config['PROCESSING'] = {
+            'frame_scale': '0.5',
+            'max_runtime_minutes': '30'
+        }
         config['DETECTION'] = {
             'supported_classes': 'person,car,truck,bus,motorcycle,bicycle,dog,cat,bird,horse,cow'
         }
@@ -49,6 +53,8 @@ def load_config():
         'min_detections': config.getint('THRESHOLDS', 'min_detections', fallback=8),
         'delete_older_than': config.getint('THRESHOLDS', 'delete_older_than', fallback=259200),
         'delete_originals': config.getboolean('THRESHOLDS', 'delete_originals', fallback=True),
+        'frame_scale': config.getfloat('PROCESSING', 'frame_scale', fallback=0.5),
+        'max_runtime_minutes': config.getint('PROCESSING', 'max_runtime_minutes', fallback=30),
         'supported_classes': [cls.strip() for cls in supported_classes.split(',')]
     }
 
@@ -68,6 +74,7 @@ def find_timestamp_files(upload_dir):
 
 def process_timestamp_file(filename, upload_dir, model, config):
     """Process a single timestamp file: analyze video1 and video2 separately and save results."""
+    start_time = time.time()
     basefilename, _ = os.path.splitext(filename)
     json_path = os.path.join(upload_dir, filename)
     
@@ -102,8 +109,8 @@ def process_timestamp_file(filename, upload_dir, model, config):
         return False
     
     # Process video1 and video2 separately
-    moving_count1, detections1, track_movements1, track_detection_counts1 = process_video(video1_path, model, "VIDEO1")
-    moving_count2, detections2, track_movements2, track_detection_counts2 = process_video(video2_path, model, "VIDEO2")
+    moving_count1, detections1, track_movements1, track_detection_counts1 = process_video(video1_path, model, "VIDEO1", config)
+    moving_count2, detections2, track_movements2, track_detection_counts2 = process_video(video2_path, model, "VIDEO2", config)
     
     total_moving_count = moving_count1 + moving_count2
     
@@ -128,13 +135,22 @@ def process_timestamp_file(filename, upload_dir, model, config):
     shutil.move(video1_path, processed_video1)
     shutil.move(video2_path, processed_video2)
     
+    # Move image file if it exists
+    if 'image' in data:
+        image_path = os.path.join(upload_dir, data['image'])
+        if os.path.exists(image_path):
+            processed_image = os.path.join(time_dir, data['image'])
+            shutil.move(image_path, processed_image)
+    
     # Create and save results
     save_results(data, total_moving_count, all_detections, all_track_movements, all_track_detection_counts, 
                 data['video1'], data['video2'], results_json_file)
     
     # Delete original JSON file
     os.remove(json_path)
+    processing_time = time.time() - start_time
     print(f"Deleted original JSON file: {filename}")
+    print(f"Processing time: {processing_time:.2f} seconds")
     
     return True
 
@@ -160,6 +176,8 @@ def analyze_videos():
     """Main function to analyze all timestamp files in the upload directory."""
     config = load_config()
     upload_dir = config['upload_dir']
+    start_time = time.time()
+    max_runtime = config['max_runtime_minutes'] * 60
     
     try:
         model = YOLO('yolov8n.pt')
@@ -171,12 +189,17 @@ def analyze_videos():
     json_files = find_timestamp_files(upload_dir)
     
     for filename in json_files:
+        # Check if maximum runtime exceeded
+        if time.time() - start_time > max_runtime:
+            print(f"Maximum runtime of {config['max_runtime_minutes']} minutes exceeded. Stopping processing.")
+            break
+            
         try:
             process_timestamp_file(filename, upload_dir, model, config)
         except Exception as e:
             print(f"Error processing {filename}: {e}")
 
-def process_video(video_path, model, video_type=""):
+def process_video(video_path, model, video_type="", config=None):
     """Process a video file using YOLO object detection and tracking.
     Returns: moving_count, detections, track_movements, track_detection_counts
     """
@@ -199,6 +222,15 @@ def process_video(video_path, model, video_type=""):
                     # Convert PyAV frame to numpy array
                     img = frame.to_ndarray(format='bgr24')
                     
+                    # Scale frame for faster processing
+                    if config and config['frame_scale'] != 1.0:
+                        h, w = img.shape[:2]
+                        new_h, new_w = int(h * config['frame_scale']), int(w * config['frame_scale'])
+                        img = cv2.resize(img, (new_w, new_h))
+                        scale_factor = config['frame_scale']
+                    else:
+                        scale_factor = 1.0
+                    
                     try:
                         results = model(img, verbose=False)
                         current_detections = []
@@ -210,9 +242,11 @@ def process_video(video_path, model, video_type=""):
                                     conf = float(box.conf[0])
                                     if conf > 0.5:
                                         class_name = model.names[cls]
-                                        config = load_config()
                                         if class_name in config['supported_classes']:
                                             x1, y1, x2, y2 = box.xyxy[0].tolist()
+                                            # Scale coordinates back to original size
+                                            if scale_factor != 1.0:
+                                                x1, y1, x2, y2 = x1/scale_factor, y1/scale_factor, x2/scale_factor, y2/scale_factor
                                             center_x = int((x1 + x2) / 2)
                                             center_y = int((y1 + y2) / 2)
                                             detection = {
