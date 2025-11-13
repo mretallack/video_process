@@ -11,15 +11,44 @@ import configparser
 import re
 import shutil
 import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from ultralytics import YOLO
 
 
 
-def setup_logging(log_level):
-    """Setup logging configuration"""
+def setup_logging(config):
+    """Setup logging configuration with optional file logging"""
+    log_level = config.get('log_level', 'INFO')
     level = getattr(logging, log_level.upper(), logging.INFO)
-    logging.basicConfig(level=level, format='%(asctime)s - %(levelname)s - %(message)s')
+    
+    # Clear any existing handlers
+    logging.getLogger().handlers.clear()
+    
+    # Create formatter
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    
+    # Add console handler if enabled
+    if config.get('log_to_console', True):
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
+        console_handler.setFormatter(formatter)
+        logging.getLogger().addHandler(console_handler)
+    
+    # Add file handler if enabled
+    if config.get('log_to_file', False):
+        log_file = config.get('log_file', 'video_analyzer.log')
+        max_size = config.get('max_log_size_mb', 10) * 1024 * 1024  # Convert MB to bytes
+        backup_count = config.get('log_backup_count', 3)
+        
+        file_handler = RotatingFileHandler(
+            log_file, maxBytes=max_size, backupCount=backup_count
+        )
+        file_handler.setLevel(level)
+        file_handler.setFormatter(formatter)
+        logging.getLogger().addHandler(file_handler)
+    
+    logging.getLogger().setLevel(level)
     return logging.getLogger(__name__)
 
 def load_config():
@@ -28,31 +57,8 @@ def load_config():
     
     # Default values
     if not os.path.exists(config_file):
-        config['PATHS'] = {
-            'upload_dir': '/home/mark/.homeassistant/videos/camera_upload',
-            'processed_dir': '/home/mark/.homeassistant/videos/processed'
-        }
-        config['THRESHOLDS'] = {
-            'movement_threshold': '30',
-            'min_detections': '8',
-            'delete_older_than': '259200',
-            'delete_originals': 'true'
-        }
-        config['PROCESSING'] = {
-            'frame_scale': '0.5',
-            'max_runtime_minutes': '30',
-            'frame_skip': '2'
-        }
-        config['LOGGING'] = {
-            'log_level': 'INFO'
-        }
-        config['DETECTION'] = {
-            'supported_classes': 'person,car,truck,bus,motorcycle,bicycle,dog,cat,bird,horse,cow',
-            'min_confidence': '0.6'
-        }
-        with open(config_file, 'w') as f:
-            config.write(f)
-        #print(f"Created default config file: {config_file}")
+        # throw exception
+        raise FileNotFoundError(f"Configuration file {config_file} not found. Please create it.")        
     else:
         config.read(config_file)
     
@@ -64,12 +70,19 @@ def load_config():
         'movement_threshold': config.getfloat('THRESHOLDS', 'movement_threshold', fallback=30),
         'min_detections': config.getint('THRESHOLDS', 'min_detections', fallback=8),
         'delete_older_than': config.getint('THRESHOLDS', 'delete_older_than', fallback=259200),
-        'delete_originals': config.getboolean('THRESHOLDS', 'delete_originals', fallback=True),
+        'delete_originals': config.getboolean('PROCESSING', 'delete_originals', fallback=True),
+        'delete_unprocessed_if_no_detection': config.getboolean('PROCESSING', 'delete_unprocessed_if_no_detection', fallback=True),
         'frame_scale': config.getfloat('PROCESSING', 'frame_scale', fallback=0.5),
         'max_runtime_minutes': config.getint('PROCESSING', 'max_runtime_minutes', fallback=30),
         'frame_skip': config.getint('PROCESSING', 'frame_skip', fallback=2),
+        'min_track_confidence': config.getfloat('PROCESSING', 'min_track_confidence', fallback=0.6),
         'min_confidence': config.getfloat('DETECTION', 'min_confidence', fallback=0.6),
         'log_level': config.get('LOGGING', 'log_level', fallback='INFO'),
+        'log_to_file': config.getboolean('LOGGING', 'log_to_file', fallback=False),
+        'log_to_console': config.getboolean('LOGGING', 'log_to_console', fallback=True),
+        'log_file': config.get('LOGGING', 'log_file', fallback='video_analyzer.log'),
+        'max_log_size_mb': config.getint('LOGGING', 'max_log_size_mb', fallback=10),
+        'log_backup_count': config.getint('LOGGING', 'log_backup_count', fallback=3),
         'supported_classes': [cls.strip() for cls in supported_classes.split(',')]
     }
 
@@ -100,7 +113,7 @@ def process_timestamp_file(filename, upload_dir, model, config):
     os.makedirs(time_dir, exist_ok=True)
     results_json_file = os.path.join(time_dir, f"{basefilename}_results.json")
     
-    logger = setup_logging(config['log_level'])
+    logger = setup_logging(config)
     logger.info(f"Processing JSON file: {filename}")
     
     # Check if file is older than threshold
@@ -139,8 +152,11 @@ def process_timestamp_file(filename, upload_dir, model, config):
     #print(f"Total: {total_moving_count} moving objects detected")
     
     if total_moving_count == 0:
-        #print(f"No movement detected. Deleting files for {filename}")
-        delete_video_file(upload_dir, basefilename)
+        if config['delete_unprocessed_if_no_detection']:
+            logger.info(f"No movement detected. Deleting files for {filename}")
+            delete_video_file(upload_dir, basefilename)
+        else:
+            logger.info(f"No movement detected. Would delete files for {filename}")
         return False
     
     # Combine results from both videos
@@ -151,7 +167,7 @@ def process_timestamp_file(filename, upload_dir, model, config):
     # Create human-readable filenames
     human_timestamp = dt.strftime('%Y-%m-%d_%H-%M-%S')
     
-    # Rename and move video files
+    # Rename and move/copy video files based on delete_originals setting
     video1_ext = os.path.splitext(data['video1'])[1]
     video2_ext = os.path.splitext(data['video2'])[1]
     new_video1_name = f"{human_timestamp}_video1{video1_ext}"
@@ -159,10 +175,15 @@ def process_timestamp_file(filename, upload_dir, model, config):
     
     processed_video1 = os.path.join(time_dir, new_video1_name)
     processed_video2 = os.path.join(time_dir, new_video2_name)
-    shutil.move(video1_path, processed_video1)
-    shutil.move(video2_path, processed_video2)
     
-    # Move and rename image file if it exists
+    if config['delete_originals']:
+        shutil.move(video1_path, processed_video1)
+        shutil.move(video2_path, processed_video2)
+    else:
+        shutil.copy2(video1_path, processed_video1)
+        shutil.copy2(video2_path, processed_video2)
+    
+    # Move/copy and rename image file if it exists
     new_image_name = None
     if 'image' in data:
         image_path = os.path.join(upload_dir, data['image'])
@@ -170,15 +191,21 @@ def process_timestamp_file(filename, upload_dir, model, config):
             image_ext = os.path.splitext(data['image'])[1]
             new_image_name = f"{human_timestamp}_image{image_ext}"
             processed_image = os.path.join(time_dir, new_image_name)
-            shutil.move(image_path, processed_image)
+            if config['delete_originals']:
+                shutil.move(image_path, processed_image)
+            else:
+                shutil.copy2(image_path, processed_image)
     
     # Create and save results with new filenames
     save_results(data, total_moving_count, all_detections, all_track_movements, all_track_detection_counts, 
                 new_video1_name, new_video2_name, new_image_name, results_json_file)
     
-    # Delete original JSON file
-    os.remove(json_path)
-    logger.info(f"Deleted original JSON file: {filename}")
+    # Delete original JSON file only if delete_originals is enabled
+    if config['delete_originals']:
+        os.remove(json_path)
+        logger.info(f"Deleted original JSON file: {filename}")
+    else:
+        logger.info(f"Keeping original JSON file: {filename}")
     
     return True
 
@@ -211,7 +238,7 @@ def analyze_videos():
         model = YOLO('yolov8n.pt')
         #print("YOLO model loaded successfully")
     except Exception as e:
-        logger = setup_logging(config['log_level'])
+        logger = setup_logging(config)
         logger.error(f"Error loading YOLO model: {e}")
         return
     
@@ -294,6 +321,7 @@ def process_video(video_path, model, video_type="", config=None):
                                                 'center': (center_x, center_y),
                                                 'bbox': (x1, y1, x2, y2)
                                             }
+                                            logger.debug(detection)
                                             current_detections.append(detection)
                                             all_detections.append(detection.copy())
                         
@@ -306,6 +334,7 @@ def process_video(video_path, model, video_type="", config=None):
                                 if tracker['class'] == detection['class']:
                                     distance = np.sqrt((tracker['center'][0] - detection['center'][0])**2 + 
                                                      (tracker['center'][1] - detection['center'][1])**2)
+                                    #print(f"track_id={track_id}, class={tracker['class']}, distance={distance}")
                                     if distance < min_distance and distance < 100:  # threshold
                                         min_distance = distance
                                         best_match = track_id
@@ -313,11 +342,17 @@ def process_video(video_path, model, video_type="", config=None):
                             if best_match:
                                 trackers[best_match]['center'] = detection['center']
                                 trackers[best_match]['confidence'] = detection['confidence']
+                                # Track maximum confidence for this track
+                                if 'max_confidence' not in trackers[best_match]:
+                                    trackers[best_match]['max_confidence'] = detection['confidence']
+                                else:
+                                    trackers[best_match]['max_confidence'] = max(trackers[best_match]['max_confidence'], detection['confidence'])
                                 track_id = best_match
                             else:
                                 track_id = next_id
                                 trackers[track_id] = detection.copy()
                                 trackers[track_id]['initial_center'] = detection['center']
+                                trackers[track_id]['max_confidence'] = detection['confidence']
                                 next_id += 1
                             
                             # Update detection with track_id and remove bbox
@@ -353,8 +388,13 @@ def process_video(video_path, model, video_type="", config=None):
                 # Load config for thresholds
                 config = load_config()
                 
-                # Require both movement AND sufficient detection density
-                if total_movement > config['movement_threshold'] and detection_count >= config['min_detections']:
+                # Require movement, sufficient detection density, AND minimum track confidence
+                max_confidence = tracker.get('max_confidence', 0.0)
+                logger.info(f"track_id={track_id}, class={tracker['class']}, "
+                            f"total_movement={total_movement}, detection_count={detection_count}, max_confidence={max_confidence}")
+                if (total_movement > config['movement_threshold'] and 
+                    detection_count >= config['min_detections'] and 
+                    max_confidence >= config['min_track_confidence']):
                     moving_objects.add(track_id)
         
         #print(f"Processed {frame_count} frames from {video_path} ({video_type})")
@@ -409,7 +449,7 @@ def cleanup_old_results():
     config = load_config()
     processed_dir = config['processed_dir']
     delete_older_than = config['delete_older_than']
-    logger = setup_logging(config['log_level'])
+    logger = setup_logging(config)
     
     if not os.path.exists(processed_dir):
         return
@@ -477,5 +517,5 @@ if __name__ == "__main__":
         cleanup_old_results()
     except KeyboardInterrupt:
         print("\nAnalysis interrupted by user")
-    except Exception as e:
-        print(f"Unexpected error: {e}")
+    #except Exception as e:
+    #    print(f"Unexpected error: {e}")
