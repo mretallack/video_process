@@ -230,6 +230,7 @@ def save_results(data, moving_count, detections, track_movements, track_detectio
 def analyze_videos():
     """Main function to analyze all timestamp files in the upload directory."""
     config = load_config()
+    logger = setup_logging(config)
     upload_dir = config['upload_dir']
     start_time = time.time()
     max_runtime = config['max_runtime_minutes'] * 60
@@ -238,7 +239,6 @@ def analyze_videos():
         model = YOLO('yolov8n.pt')
         #print("YOLO model loaded successfully")
     except Exception as e:
-        logger = setup_logging(config)
         logger.error(f"Error loading YOLO model: {e}")
         return
     
@@ -403,7 +403,7 @@ def process_video(video_path, model, video_type="", config=None):
         
     except Exception as e:
         logger.error(f"Error opening video {video_path}: {e}")
-        return 0, []
+        raise
 
 def find_result_files(directory):
     """Recursively find all _results.json files and return their full paths"""
