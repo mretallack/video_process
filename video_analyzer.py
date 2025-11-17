@@ -14,6 +14,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from ultralytics import YOLO
+from video_process import process_videos
 
 
 
@@ -196,9 +197,22 @@ def process_timestamp_file(filename, upload_dir, model, config):
             else:
                 shutil.copy2(image_path, processed_image)
     
+    # Create combined video
+    combined_video_name = f"{human_timestamp}_fullvideo.mp4"
+    combined_video_path = os.path.join(time_dir, combined_video_name)
+    
+    try:
+        result = process_videos(processed_video1, processed_video2, combined_video_path, logger)
+        if result != 0:
+            logger.error(f"Failed to create combined video for {filename}")
+            combined_video_name = None
+    except Exception as e:
+        logger.error(f"Error creating combined video for {filename}: {e}")
+        combined_video_name = None
+    
     # Create and save results with new filenames
     save_results(data, total_moving_count, all_detections, all_track_movements, all_track_detection_counts, 
-                new_video1_name, new_video2_name, new_image_name, results_json_file)
+                new_video1_name, new_video2_name, new_image_name, combined_video_name, results_json_file)
     
     # Delete original JSON file only if delete_originals is enabled
     if config['delete_originals']:
@@ -210,7 +224,7 @@ def process_timestamp_file(filename, upload_dir, model, config):
     return True
 
 def save_results(data, moving_count, detections, track_movements, track_detection_counts, 
-                video1_filename, video2_filename, image_filename, results_json_file):
+                video1_filename, video2_filename, image_filename, combined_video_filename, results_json_file):
     """Create and save the results JSON file with detection data and metadata."""
     json_results = {
         'moving_count': moving_count,
@@ -223,6 +237,9 @@ def save_results(data, moving_count, detections, track_movements, track_detectio
     
     if image_filename:
         json_results['image'] = image_filename
+    
+    if combined_video_filename:
+        json_results['combined_video'] = combined_video_filename
     
     with open(results_json_file, 'w') as f:
         json.dump(json_results, f, indent=4)
@@ -491,6 +508,13 @@ def cleanup_old_results():
                     if os.path.exists(image_path):
                         os.remove(image_path)
                         logger.debug(f"Deleted image: {data['image']}")
+                
+                # Delete combined video if it exists
+                if 'combined_video' in data:
+                    combined_video_path = os.path.join(root, data['combined_video'])
+                    if os.path.exists(combined_video_path):
+                        os.remove(combined_video_path)
+                        logger.debug(f"Deleted combined video: {data['combined_video']}")
                 
                 # Delete result file
                 os.remove(filepath)
