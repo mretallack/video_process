@@ -4,6 +4,7 @@
 import sys
 import os
 import av
+import traceback
 
 
 def process_videos(input1, input2, output, logger=None):
@@ -18,39 +19,71 @@ def process_videos(input1, input2, output, logger=None):
         # Open first input video to get properties
         container1 = av.open(input1)
         video_stream1 = container1.streams.video[0]
+        audio_stream1 = container1.streams.audio[0] if container1.streams.audio else None
         
         # Create output container with absolute path
         output = os.path.abspath(output)
         output_container = av.open(output, mode='w', format='webm')
-        output_stream = output_container.add_stream('libvpx', rate=video_stream1.average_rate)
-        output_stream.width = video_stream1.width
-        output_stream.height = video_stream1.height
-        output_stream.pix_fmt = 'yuv420p'
-        output_stream.bit_rate = 5000000
-        output_stream.options = {'crf': '4', 'b:v': '5M', 'quality': 'best', 'cpu-used': '0'}
-        output_stream.time_base = video_stream1.time_base
         
-        pts_offset = 0
-        frame_duration = int(output_stream.time_base.denominator / output_stream.average_rate) * 2
+        # Use fallback frame rate if average_rate is None
+        frame_rate = video_stream1.average_rate or av.Rational(25, 1)
+        
+        output_video_stream = output_container.add_stream('libvpx', rate=frame_rate)
+        output_video_stream.width = video_stream1.width
+        output_video_stream.height = video_stream1.height
+        output_video_stream.pix_fmt = 'yuv420p'
+        output_video_stream.bit_rate = 5000000
+        output_video_stream.options = {'crf': '4', 'b:v': '5M', 'quality': 'best', 'cpu-used': '0'}
+        output_video_stream.time_base = video_stream1.time_base or av.Rational(1, 25)
+        
+        # Add audio stream if available
+        output_audio_stream = None
+        if audio_stream1:
+            output_audio_stream = output_container.add_stream('libvorbis')
+            output_audio_stream.rate = audio_stream1.rate
+            output_audio_stream.format = audio_stream1.format
+            output_audio_stream.layout = audio_stream1.layout
+            output_audio_stream.time_base = audio_stream1.time_base or av.Rational(1, audio_stream1.rate)
+        
+        video_pts_offset = 0
+        audio_pts_offset = 0
+        frame_duration = int(output_video_stream.time_base.denominator / frame_rate) * 2
         if logger:
             logger.info(f"Processing {input1} -> {output}")
         else:
             print(f"Processing {input1} -> {output}")
         
-        # Process first video
-        for packet in container1.demux(video_stream1):
+        # Process first video and audio
+        for packet in container1.demux():
             try:
-                frames = video_stream1.decode(packet)
-                for frame in frames:
-                    # Convert frame to match output format
-                    frame = frame.reformat(width=output_stream.width, height=output_stream.height, format=output_stream.pix_fmt)
-                    frame.pts = pts_offset
-                    frame.time_base = output_stream.time_base
-                    pts_offset += frame_duration
-                    
-                    for out_packet in output_stream.encode(frame):
-                        output_container.mux(out_packet)
-            except (av.InvalidDataError, av.error.InvalidDataError):
+                if packet.stream == video_stream1:
+                    frames = video_stream1.decode(packet)
+                    for frame in frames:
+                        frame = frame.reformat(width=output_video_stream.width, height=output_video_stream.height, format=output_video_stream.pix_fmt)
+                        frame.pts = video_pts_offset
+                        frame.time_base = output_video_stream.time_base
+                        video_pts_offset += frame_duration
+                        
+                        for out_packet in output_video_stream.encode(frame):
+                            output_container.mux(out_packet)
+                elif packet.stream == audio_stream1 and output_audio_stream:
+                    frames = audio_stream1.decode(packet)
+                    for frame in frames:
+                        frame.pts = audio_pts_offset
+                        frame.time_base = output_audio_stream.time_base
+                        audio_pts_offset += frame.samples
+                        
+                        for out_packet in output_audio_stream.encode(frame):
+                            output_container.mux(out_packet)
+            except (av.InvalidDataError, av.error.InvalidDataError) as e:
+                if logger:
+                    logger.debug(f"Invalid data in video1 packet: {e}")
+                continue
+            except Exception as e:
+                if logger:
+                    logger.error(f"Error processing video1 packet: {e}\n{traceback.format_exc()}")
+                else:
+                    print(f"Error processing video1 packet: {e}\n{traceback.format_exc()}")
                 continue
         
         container1.close()
@@ -58,36 +91,64 @@ def process_videos(input1, input2, output, logger=None):
         # Process second video
         container2 = av.open(input2)
         video_stream2 = container2.streams.video[0]
+        audio_stream2 = container2.streams.audio[0] if container2.streams.audio else None
         
         if logger:
             logger.info(f"Processing {input2} -> {output}")
         else:
             print(f"Processing {input2} -> {output}")
         
-        for packet in container2.demux(video_stream2):
+        for packet in container2.demux():
             try:
-                frames = video_stream2.decode(packet)
-                for frame in frames:
-                    # Convert frame to match output format
-                    frame = frame.reformat(width=output_stream.width, height=output_stream.height, format=output_stream.pix_fmt)
-                    frame.pts = pts_offset
-                    frame.time_base = output_stream.time_base
-                    pts_offset += frame_duration
-                    
-                    for out_packet in output_stream.encode(frame):
-                        output_container.mux(out_packet)
-            except (av.InvalidDataError, av.error.InvalidDataError):
+                if packet.stream == video_stream2:
+                    frames = video_stream2.decode(packet)
+                    for frame in frames:
+                        frame = frame.reformat(width=output_video_stream.width, height=output_video_stream.height, format=output_video_stream.pix_fmt)
+                        frame.pts = video_pts_offset
+                        frame.time_base = output_video_stream.time_base
+                        video_pts_offset += frame_duration
+                        
+                        for out_packet in output_video_stream.encode(frame):
+                            output_container.mux(out_packet)
+                elif packet.stream == audio_stream2 and output_audio_stream:
+                    frames = audio_stream2.decode(packet)
+                    for frame in frames:
+                        frame.pts = audio_pts_offset
+                        frame.time_base = output_audio_stream.time_base
+                        audio_pts_offset += frame.samples
+                        
+                        for out_packet in output_audio_stream.encode(frame):
+                            output_container.mux(out_packet)
+            except (av.InvalidDataError, av.error.InvalidDataError) as e:
+                if logger:
+                    logger.debug(f"Invalid data in video2 packet: {e}")
                 continue
             except Exception as e:
                 if logger:
-                    logger.error(f"Error processing frame: {e}")
+                    logger.error(f"Error processing video2 packet: {e}\n{traceback.format_exc()}")
                 else:
-                    print(f"Error processing frame: {e}")
+                    print(f"Error processing video2 packet: {e}\n{traceback.format_exc()}")
                 continue
 
-        # Flush encoder
-        for out_packet in output_stream.encode():
-            output_container.mux(out_packet)
+        # Flush encoders
+        try:
+            for out_packet in output_video_stream.encode():
+                output_container.mux(out_packet)
+        except Exception as e:
+            if logger:
+                logger.error(f"Error flushing video encoder: {e}\n{traceback.format_exc()}")
+            else:
+                print(f"Error flushing video encoder: {e}\n{traceback.format_exc()}")
+        
+        if output_audio_stream:
+            try:
+                for out_packet in output_audio_stream.encode():
+                    output_container.mux(out_packet)
+            except Exception as e:
+                if logger:
+                    logger.error(f"Error flushing audio encoder: {e}\n{traceback.format_exc()}")
+                else:
+                    print(f"Error flushing audio encoder: {e}\n{traceback.format_exc()}")
         
         container2.close()
         output_container.close()
@@ -100,9 +161,9 @@ def process_videos(input1, input2, output, logger=None):
         
     except Exception as e:
         if logger:
-            logger.error(f"Error: {e}")
+            logger.error(f"Fatal error in process_videos: {e}\n{traceback.format_exc()}")
         else:
-            print(f"Error: {e}")
+            print(f"Fatal error in process_videos: {e}\n{traceback.format_exc()}")
         return 1
 
 
